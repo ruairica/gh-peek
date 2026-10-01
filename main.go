@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -48,12 +49,42 @@ func statusBadge(status string, base lipgloss.Style) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: gh-util [flags] [branch]\n\nFlags:\n  -ci     Open CI check runs (current branch, or [branch] if given)\n  -pr     Open pull requests (current branch, or [branch] if given)\n  -wait   Poll until check runs or pull requests are available (use with -ci or -pr)\n")
+	fmt.Fprintf(os.Stderr, "Usage: gh-util [flags] [branch]\n\nFlags:\n  -ci     Open CI check runs (current branch, or [branch] if given)\n  -pr     Open pull requests (current branch, or [branch] if given)\n  -wait   Poll until check runs or pull requests are available (use with -ci or -pr)\n  -plain  Print results as tab-separated text instead of opening the picker (for scripts and AI agents)\n\nExit codes (-plain):\n  0  Results found\n  1  Error\n  2  No check runs or pull requests found\n")
 }
 
-func runChecks(info RepoInfo, wait bool) error {
+// errNoResults signals that nothing was found; in -plain mode it exits with
+// code 2 so callers can tell "nothing yet" apart from a real error.
+var errNoResults = errors.New("no results")
+
+// notFound reports an empty result. In plain mode the message goes to stderr
+// so stdout only ever holds results.
+func notFound(plain bool, msg string) error {
+	if plain {
+		fmt.Fprintln(os.Stderr, msg)
+		return errNoResults
+	}
+	fmt.Println(msg)
+	return nil
+}
+
+// waiting reports a -wait poll. The picker path redraws one line in place;
+// plain mode logs it once to stderr so agents don't get a stream of \r updates.
+func waiting(plain bool, polls int, msg string) {
+	if !plain {
+		fmt.Print("\r" + msg)
+	} else if polls == 0 {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+}
+
+// plainField makes free text safe for a tab-separated column.
+func plainField(s string) string {
+	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
+}
+
+func runChecks(info RepoInfo, wait, plain bool) error {
 	var checks []Check
-	for {
+	for polls := 0; ; polls++ {
 		var err error
 		checks, err = fetchChecks(info.Owner, info.Repo, info.Branch)
 		if err != nil {
@@ -63,11 +94,9 @@ func runChecks(info RepoInfo, wait bool) error {
 			break
 		}
 		if !wait {
-			fmt.Printf("No check runs found on branch '%s'.\n", info.Branch)
-			fmt.Println("This branch may not have triggered any checks yet. Try pushing first.")
-			return nil
+			return notFound(plain, fmt.Sprintf("No check runs found on branch '%s'.\nThis branch may not have triggered any checks yet. Try pushing first.", info.Branch))
 		}
-		fmt.Printf("\rWaiting for checks on '%s'...", info.Branch)
+		waiting(plain, polls, fmt.Sprintf("Waiting for checks on '%s'...", info.Branch))
 		time.Sleep(time.Second)
 	}
 
@@ -90,6 +119,15 @@ func runChecks(info RepoInfo, wait bool) error {
 		parents = append(parents, c)
 	}
 
+	if plain {
+		fmt.Printf("# gh-util: check runs for %s/%s (%s)\n", info.Owner, info.Repo, info.Branch)
+		fmt.Println("status\tname\turl")
+		for _, p := range parents {
+			fmt.Printf("%s\t%s\t%s\n", p.Status, plainField(p.Name), p.URL)
+		}
+		return nil
+	}
+
 	var items []pickerItem
 	for _, p := range parents {
 		item := pickerItem{name: fmt.Sprintf("%-*s", checkNameWidth, p.Name), status: p.Status, url: p.URL}
@@ -110,9 +148,9 @@ func runChecks(info RepoInfo, wait bool) error {
 	return runPicker(fmt.Sprintf("Checks — %s/%s (%s)", info.Owner, info.Repo, info.Branch), items)
 }
 
-func runPR(info RepoInfo, wait bool) error {
+func runPR(info RepoInfo, wait, plain bool) error {
 	var prs []PR
-	for {
+	for polls := 0; ; polls++ {
 		var prsFrom, prsInto []PR
 
 		g := new(errgroup.Group)
@@ -147,11 +185,19 @@ func runPR(info RepoInfo, wait bool) error {
 			break
 		}
 		if !wait {
-			fmt.Printf("No open pull requests found for branch '%s'.\n", info.Branch)
-			return nil
+			return notFound(plain, fmt.Sprintf("No open pull requests found for branch '%s'.", info.Branch))
 		}
-		fmt.Printf("\rWaiting for pull requests on '%s'...", info.Branch)
+		waiting(plain, polls, fmt.Sprintf("Waiting for pull requests on '%s'...", info.Branch))
 		time.Sleep(time.Second)
+	}
+
+	if plain {
+		fmt.Printf("# gh-util: open pull requests from or into %s in %s/%s\n", info.Branch, info.Owner, info.Repo)
+		fmt.Println("number\tdraft\thead\tbase\turl\ttitle")
+		for _, pr := range prs {
+			fmt.Printf("%d\t%t\t%s\t%s\t%s\t%s\n", pr.Number, pr.Draft, pr.HeadRef, pr.BaseRef, pr.URL, plainField(pr.Title))
+		}
+		return nil
 	}
 
 	items := make([]pickerItem, len(prs))
@@ -171,6 +217,7 @@ func main() {
 	ciFlag := flag.Bool("ci", false, "Open CI check runs for the current branch")
 	prFlag := flag.Bool("pr", false, "Open pull requests for the current branch")
 	waitFlag := flag.Bool("wait", false, "Poll until check runs or pull requests are available (use with -ci or -pr)")
+	plainFlag := flag.Bool("plain", false, "Print results as tab-separated text instead of opening the picker")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -197,11 +244,14 @@ func main() {
 	}
 
 	if *ciFlag {
-		err = runChecks(info, *waitFlag)
+		err = runChecks(info, *waitFlag, *plainFlag)
 	} else {
-		err = runPR(info, *waitFlag)
+		err = runPR(info, *waitFlag, *plainFlag)
 	}
 
+	if errors.Is(err, errNoResults) {
+		os.Exit(2)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
