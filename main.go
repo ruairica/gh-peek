@@ -4,12 +4,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/sync/errgroup"
+	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/cli/go-gh/v2/pkg/term"
 )
 
 // checkNameWidth is the column width check names are padded to so status
@@ -48,8 +50,25 @@ func statusBadge(status string, base lipgloss.Style) string {
 	}
 }
 
+const usageText = `Open CI check runs or pull requests for a branch.
+
+Usage:
+  gh peek ci [branch] [flags]   Open CI check runs (current branch, or [branch] if given)
+  gh peek pr [branch] [flags]   Open pull requests from or into the branch
+
+Flags:
+  --wait    Poll until check runs or pull requests are available
+  --plain   Print tab-separated text instead of opening the picker (for scripts and
+            AI agents); also used automatically when stdin or stdout is not a terminal
+
+Exit codes:
+  0  Results found
+  1  Error
+  2  No check runs or pull requests found (plain output only)
+`
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: gh-util [flags] [branch]\n\nFlags:\n  -ci     Open CI check runs (current branch, or [branch] if given)\n  -pr     Open pull requests (current branch, or [branch] if given)\n  -wait   Poll until check runs or pull requests are available (use with -ci or -pr)\n  -plain  Print results as tab-separated text instead of opening the picker (for scripts and AI agents)\n\nExit codes (-plain):\n  0  Results found\n  1  Error\n  2  No check runs or pull requests found\n")
+	fmt.Fprint(os.Stderr, usageText)
 }
 
 // errNoResults signals that nothing was found; in -plain mode it exits with
@@ -83,10 +102,14 @@ func plainField(s string) string {
 }
 
 func runChecks(info RepoInfo, wait, plain bool) error {
+	client, err := api.NewRESTClient(api.ClientOptions{Host: info.Host})
+	if err != nil {
+		return err
+	}
+
 	var checks []Check
 	for polls := 0; ; polls++ {
-		var err error
-		checks, err = fetchChecks(info.Owner, info.Repo, info.Branch)
+		checks, err = fetchChecks(client, info)
 		if err != nil {
 			return err
 		}
@@ -120,7 +143,7 @@ func runChecks(info RepoInfo, wait, plain bool) error {
 	}
 
 	if plain {
-		fmt.Printf("# gh-util: check runs for %s/%s (%s)\n", info.Owner, info.Repo, info.Branch)
+		fmt.Printf("# gh peek ci: check runs for %s/%s (%s)\n", info.Owner, info.Repo, info.Branch)
 		fmt.Println("status\tname\turl")
 		for _, p := range parents {
 			fmt.Printf("%s\t%s\t%s\n", p.Status, plainField(p.Name), p.URL)
@@ -149,22 +172,15 @@ func runChecks(info RepoInfo, wait, plain bool) error {
 }
 
 func runPR(info RepoInfo, wait, plain bool) error {
+	client, err := api.NewGraphQLClient(api.ClientOptions{Host: info.Host})
+	if err != nil {
+		return err
+	}
+
 	var prs []PR
 	for polls := 0; ; polls++ {
-		var prsFrom, prsInto []PR
-
-		g := new(errgroup.Group)
-		g.Go(func() error {
-			var err error
-			prsFrom, err = fetchPRs(info.Branch)
-			return err
-		})
-		g.Go(func() error {
-			var err error
-			prsInto, err = fetchPRsInto(info.Branch)
-			return err
-		})
-		if err := g.Wait(); err != nil {
+		prsFrom, prsInto, err := fetchPRs(client, info)
+		if err != nil {
 			return err
 		}
 
@@ -192,7 +208,7 @@ func runPR(info RepoInfo, wait, plain bool) error {
 	}
 
 	if plain {
-		fmt.Printf("# gh-util: open pull requests from or into %s in %s/%s\n", info.Branch, info.Owner, info.Repo)
+		fmt.Printf("# gh peek pr: open pull requests from or into %s in %s/%s\n", info.Branch, info.Owner, info.Repo)
 		fmt.Println("number\tdraft\thead\tbase\turl\ttitle")
 		for _, pr := range prs {
 			fmt.Printf("%d\t%t\t%s\t%s\t%s\t%s\n", pr.Number, pr.Draft, pr.HeadRef, pr.BaseRef, pr.URL, plainField(pr.Title))
@@ -213,42 +229,80 @@ func runPR(info RepoInfo, wait, plain bool) error {
 	return runPicker(fmt.Sprintf("Pull Requests — %s", info.Branch), items)
 }
 
+// parseArgs parses a subcommand's flags and optional branch. Flags may come
+// before or after the branch, as with gh's own commands.
+func parseArgs(cmd string, args []string) (branch string, wait, plain bool, err error) {
+	fs := flag.NewFlagSet("gh peek "+cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // errors and usage are reported by main
+	fs.BoolVar(&wait, "wait", false, "")
+	fs.BoolVar(&plain, "plain", false, "")
+
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return "", false, false, err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+
+	switch len(positional) {
+	case 0:
+	case 1:
+		branch = positional[0]
+	default:
+		return "", false, false, fmt.Errorf("too many arguments; usage: gh peek %s [branch] [flags]", cmd)
+	}
+	return branch, wait, plain, nil
+}
+
 func main() {
-	ciFlag := flag.Bool("ci", false, "Open CI check runs for the current branch")
-	prFlag := flag.Bool("pr", false, "Open pull requests for the current branch")
-	waitFlag := flag.Bool("wait", false, "Poll until check runs or pull requests are available (use with -ci or -pr)")
-	plainFlag := flag.Bool("plain", false, "Print results as tab-separated text instead of opening the picker")
-
-	flag.Usage = usage
-	flag.Parse()
-
-	if !*ciFlag && !*prFlag {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	args := flag.Args()
-	if len(args) > 1 {
-		fmt.Fprintln(os.Stderr, "Error: too many arguments; usage: gh-util -ci|-pr [branch]")
+	cmd, args := os.Args[1], os.Args[2:]
+	run := map[string]func(RepoInfo, bool, bool) error{"ci": runChecks, "pr": runPR}[cmd]
+	if run == nil {
+		switch name := strings.TrimLeft(cmd, "-"); {
+		case name == "h" || name == "help":
+			usage()
+			os.Exit(0)
+		case name == "ci" || name == "pr":
+			fmt.Fprintf(os.Stderr, "Error: %s is now a subcommand; use: gh peek %s\n", cmd, name)
+		default:
+			fmt.Fprintf(os.Stderr, "Error: unknown command %q\n\n", cmd)
+			usage()
+		}
 		os.Exit(1)
 	}
 
-	info, err := getRepoInfo()
+	branch, wait, plain, err := parseArgs(cmd, args)
+	if errors.Is(err, flag.ErrHelp) {
+		usage()
+		os.Exit(0)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+		usage()
+		os.Exit(1)
+	}
+
+	// The picker needs a real terminal to draw on and read keys from, so fall
+	// back to plain output when either end is redirected (pipes, most agents).
+	plain = plain || !term.FromEnv().IsTerminalOutput() || !term.IsTerminal(os.Stdin)
+
+	info, err := getRepoInfo(branch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(args) == 1 {
-		info.Branch = args[0]
-	}
-
-	if *ciFlag {
-		err = runChecks(info, *waitFlag, *plainFlag)
-	} else {
-		err = runPR(info, *waitFlag, *plainFlag)
-	}
-
+	err = run(info, wait, plain)
 	if errors.Is(err, errNoResults) {
 		os.Exit(2)
 	}

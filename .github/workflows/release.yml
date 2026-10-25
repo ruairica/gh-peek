@@ -1,0 +1,24 @@
+# Pushing a tag like v1.0.0 cross-compiles gh-peek and attaches binaries named
+# gh-peek-<os>-<arch>[.exe] to a GitHub release, which is the layout
+# `gh extension install ruairica/gh-peek` looks for.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          go_version_file: go.mod
+          generate_attestations: true
