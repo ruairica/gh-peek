@@ -3,15 +3,19 @@ A [GitHub CLI](https://cli.github.com/) extension that quickly opens CI check ru
 ## Install
 
 ```sh
-gh extension install ruairica/gh-peek   # once a release is published
+gh extension install ruairica/gh-peek
+gh extension upgrade peek               # update to the latest release
 ```
 
 From a clone (local development):
 
 ```sh
+gh extension remove peek                     # only one `peek` can be installed at a time
 go build -ldflags="-s -w" -o gh-peek.exe .   # drop .exe on macOS/Linux
 gh extension install .
 ```
+
+Rebuilding then updates the local install straight away.
 
 `go install github.com/ruairica/gh-peek@latest` also works if you'd rather run it as `gh-peek` directly.
 
