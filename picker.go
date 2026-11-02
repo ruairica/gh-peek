@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,7 +13,7 @@ type pickerItem struct {
 	status string // raw check status, styled at render time; "" for PR rows
 	extra  string // plain dim suffix like "+3"; "" if none
 	url    string
-	child  bool // sub-stage row, hidden until the picker is expanded
+	child  bool // sub-stage row, hidden until its parent row is expanded
 }
 
 var (
@@ -28,8 +27,8 @@ var (
 	pickerErrStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 
 	pickerFooter   = pickerDimStyle.Render("o: open • enter: open & exit • esc: quit")
-	pickerExpand   = pickerDimStyle.Render(" • a: expand")
-	pickerCollapse = pickerDimStyle.Render(" • a: collapse")
+	pickerExpand   = pickerDimStyle.Render(" • e: expand")
+	pickerCollapse = pickerDimStyle.Render(" • e: collapse")
 )
 
 // openResultMsg reports the outcome of opening a URL in the background,
@@ -40,17 +39,26 @@ type openResultMsg struct {
 }
 
 type pickerModel struct {
-	title   string
-	items   []pickerItem
-	cursor  int
-	opened  []bool
-	showAll bool
-	err     error
+	title    string
+	items    []pickerItem
+	cursor   int
+	opened   []bool
+	expanded []bool // indexed by parent row; children follow their parent
+	err      error
+}
+
+// parentOf returns the index of the top-level row that owns item i
+// (i itself for a top-level row).
+func (m pickerModel) parentOf(i int) int {
+	for i > 0 && m.items[i].child {
+		i--
+	}
+	return i
 }
 
 // hidden reports whether the item at index i is filtered out of the view.
 func (m pickerModel) hidden(i int) bool {
-	return m.items[i].child && !m.showAll
+	return m.items[i].child && !m.expanded[m.parentOf(i)]
 }
 
 // moveCursor returns the cursor shifted by delta to the next visible row,
@@ -64,8 +72,9 @@ func (m pickerModel) moveCursor(delta int) int {
 	return m.cursor
 }
 
-func (m pickerModel) hasChildren() bool {
-	return slices.ContainsFunc(m.items, func(item pickerItem) bool { return item.child })
+// hasChildren reports whether the top-level row at index p has sub-stage rows.
+func (m pickerModel) hasChildren(p int) bool {
+	return p+1 < len(m.items) && m.items[p+1].child
 }
 
 func (m pickerModel) Init() tea.Cmd {
@@ -85,10 +94,12 @@ func (m pickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = m.moveCursor(-1)
 		case "down", "j":
 			m.cursor = m.moveCursor(1)
-		case "a":
-			m.showAll = !m.showAll
-			for m.cursor > 0 && m.hidden(m.cursor) {
-				m.cursor--
+		case "e":
+			if p := m.parentOf(m.cursor); m.hasChildren(p) {
+				m.expanded[p] = !m.expanded[p]
+				if m.hidden(m.cursor) {
+					m.cursor = p
+				}
 			}
 		case "o":
 			i := m.cursor
@@ -143,8 +154,8 @@ func (m pickerModel) View() string {
 		b.WriteString(pickerErrStyle.Render("Error: "+m.err.Error()) + "\n")
 	}
 	b.WriteString(pickerFooter)
-	if m.hasChildren() {
-		if m.showAll {
+	if p := m.parentOf(m.cursor); m.hasChildren(p) {
+		if m.expanded[p] {
 			b.WriteString(pickerCollapse)
 		} else {
 			b.WriteString(pickerExpand)
@@ -164,9 +175,10 @@ func runPicker(title string, items []pickerItem) error {
 	}
 
 	final, err := tea.NewProgram(pickerModel{
-		title:  lipgloss.NewStyle().Bold(true).Render(title),
-		items:  items,
-		opened: make([]bool, len(items)),
+		title:    lipgloss.NewStyle().Bold(true).Render(title),
+		items:    items,
+		opened:   make([]bool, len(items)),
+		expanded: make([]bool, len(items)),
 	}).Run()
 	if err != nil {
 		return fmt.Errorf("running picker: %w", err)
