@@ -1,4 +1,4 @@
-A [GitHub CLI](https://cli.github.com/) extension that quickly opens CI check runs or pull requests for your current Git branch.
+A [GitHub CLI](https://cli.github.com/) extension that quickly opens CI check runs or pull requests for your current Git branch, or the repository itself.
 
 ## Install
 
@@ -24,7 +24,10 @@ Rebuilding then updates the local install straight away.
 ```
 gh peek ci [branch] [flags]   Open CI check runs (current branch, or [branch] if given)
 gh peek pr [branch] [flags]   Open pull requests from or into the branch
+gh peek repo                  Open the repository's home page
 ```
+
+`gh peek repo` always opens the browser, with or without a terminal; `--plain` doesn't apply to it.
 
 Pass a branch name to inspect another branch without checking it out, e.g. `gh peek pr main` to see the review queue targeting `main`.
 
@@ -33,6 +36,6 @@ Flags (before or after the branch):
 - `--wait` polls until check runs or pull requests appear, then opens them. Use it when CI hasn't started yet, e.g. `gh peek ci --wait`.
 - `--plain` prints tab-separated text instead of opening the picker (for scripts and AI agents). Check runs are shown collapsed (sub-stages omitted). Progress and "not found" messages go to stderr; exits 2 when nothing is found, e.g. `gh peek ci --plain` or `gh peek pr main --plain`.
 
-Plain output is also used automatically when stdin or stdout isn't a terminal (piped, redirected, or run by most agents), since the picker can't run there. Agents should still pass `--plain` explicitly: some run commands in a pseudo-terminal, which looks like a real one.
+Plain output is also used automatically when stdin or stdout isn't a terminal (piped, redirected, or run by most agents), since the picker can't run there. The exception is `gh peek pr` finding exactly one pull request: with nothing to choose between, it opens that one in the browser, as it would in a terminal (handy for `!gh peek pr` in Claude Code). Pass `--plain` to always get text. Agents should still pass `--plain` explicitly: some run commands in a pseudo-terminal, which looks like a real one.
 
 The repository is resolved the same way `gh` resolves it (git remotes, or `GH_REPO=OWNER/REPO`), links open with `gh`'s browser setting (`GH_BROWSER`, `gh config set browser`, `BROWSER`), and API calls use your `gh auth` login.

@@ -50,16 +50,18 @@ func statusBadge(status string, base lipgloss.Style) string {
 	}
 }
 
-const usageText = `Open CI check runs or pull requests for a branch.
+const usageText = `Open CI check runs or pull requests for a branch, or the repository itself.
 
 Usage:
   gh peek ci [branch] [flags]   Open CI check runs (current branch, or [branch] if given)
   gh peek pr [branch] [flags]   Open pull requests from or into the branch
+  gh peek repo                  Open the repository's home page
 
 Flags:
   --wait    Poll until check runs or pull requests are available
   --plain   Print tab-separated text instead of opening the picker (for scripts and
-            AI agents); also used automatically when stdin or stdout is not a terminal
+            AI agents); also used automatically when stdin or stdout is not a terminal,
+            except that pr then opens a lone pull request in the browser
 
 Exit codes:
   0  Results found
@@ -101,7 +103,17 @@ func plainField(s string) string {
 	return strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
-func runChecks(info RepoInfo, wait, plain bool) error {
+// runOpts are the flags shared by the subcommands.
+type runOpts struct {
+	wait  bool
+	plain bool // print text instead of running the picker
+	// noTTY means plain was forced by a missing terminal rather than asked
+	// for with --plain, e.g. a command run from an editor or agent shell.
+	noTTY bool
+}
+
+func runChecks(info RepoInfo, opts runOpts) error {
+	wait, plain := opts.wait, opts.plain
 	client, err := api.NewRESTClient(api.ClientOptions{Host: info.Host})
 	if err != nil {
 		return err
@@ -171,7 +183,8 @@ func runChecks(info RepoInfo, wait, plain bool) error {
 	return runPicker(fmt.Sprintf("Checks — %s/%s (%s)", info.Owner, info.Repo, info.Branch), items)
 }
 
-func runPR(info RepoInfo, wait, plain bool) error {
+func runPR(info RepoInfo, opts runOpts) error {
+	wait, plain := opts.wait, opts.plain
 	client, err := api.NewGraphQLClient(api.ClientOptions{Host: info.Host})
 	if err != nil {
 		return err
@@ -207,7 +220,9 @@ func runPR(info RepoInfo, wait, plain bool) error {
 		time.Sleep(time.Second)
 	}
 
-	if plain {
+	// Without a terminal a single PR is unambiguous, so open it as the picker
+	// would; only an explicit --plain keeps it as text.
+	if plain && !(opts.noTTY && len(prs) == 1) {
 		fmt.Printf("# gh peek pr: open pull requests from or into %s in %s/%s\n", info.Branch, info.Owner, info.Repo)
 		fmt.Println("number\tdraft\thead\tbase\turl\ttitle")
 		for _, pr := range prs {
@@ -227,6 +242,13 @@ func runPR(info RepoInfo, wait, plain bool) error {
 	}
 
 	return runPicker(fmt.Sprintf("Pull Requests — %s", info.Branch), items)
+}
+
+// runRepo opens the repository's home page. There is nothing to choose
+// between, so it opens even without a terminal and ignores --plain.
+func runRepo(info RepoInfo, _ runOpts) error {
+	fmt.Printf("Opening: %s/%s\n", info.Owner, info.Repo)
+	return openURL(fmt.Sprintf("https://%s/%s/%s", info.Host, info.Owner, info.Repo))
 }
 
 // parseArgs parses a subcommand's flags and optional branch. Flags may come
@@ -249,12 +271,13 @@ func parseArgs(cmd string, args []string) (branch string, wait, plain bool, err 
 		args = fs.Args()[1:]
 	}
 
-	switch len(positional) {
-	case 0:
-	case 1:
-		branch = positional[0]
-	default:
+	switch {
+	case cmd == "repo" && len(positional) > 0:
+		return "", false, false, errors.New("too many arguments; usage: gh peek repo")
+	case len(positional) > 1:
 		return "", false, false, fmt.Errorf("too many arguments; usage: gh peek %s [branch] [flags]", cmd)
+	case len(positional) == 1:
+		branch = positional[0]
 	}
 	return branch, wait, plain, nil
 }
@@ -266,7 +289,7 @@ func main() {
 	}
 
 	cmd, args := os.Args[1], os.Args[2:]
-	run := map[string]func(RepoInfo, bool, bool) error{"ci": runChecks, "pr": runPR}[cmd]
+	run := map[string]func(RepoInfo, runOpts) error{"ci": runChecks, "pr": runPR, "repo": runRepo}[cmd]
 	if run == nil {
 		switch name := strings.TrimLeft(cmd, "-"); {
 		case name == "h" || name == "help":
@@ -281,7 +304,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	branch, wait, plain, err := parseArgs(cmd, args)
+	branch, wait, explicitPlain, err := parseArgs(cmd, args)
 	if errors.Is(err, flag.ErrHelp) {
 		usage()
 		os.Exit(0)
@@ -294,7 +317,8 @@ func main() {
 
 	// The picker needs a real terminal to draw on and read keys from, so fall
 	// back to plain output when either end is redirected (pipes, most agents).
-	plain = plain || !term.FromEnv().IsTerminalOutput() || !term.IsTerminal(os.Stdin)
+	noTTY := !explicitPlain && (!term.FromEnv().IsTerminalOutput() || !term.IsTerminal(os.Stdin))
+	opts := runOpts{wait: wait, plain: explicitPlain || noTTY, noTTY: noTTY}
 
 	info, err := getRepoInfo(branch)
 	if err != nil {
@@ -302,7 +326,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = run(info, wait, plain)
+	err = run(info, opts)
 	if errors.Is(err, errNoResults) {
 		os.Exit(2)
 	}
